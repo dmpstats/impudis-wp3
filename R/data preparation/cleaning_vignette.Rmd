@@ -1,0 +1,314 @@
+---
+title: "cleaning_vignette"
+output: html_document
+---
+
+# ImpUDis Data Management Guide
+
+This document will provide an example of the cleaning and preprocessing steps required within the template for an OWF redistribution analysis.
+
+This example is particular to kittiwake redistribution around the Beatrice OWF [REFERENCE], but the steps are generalisable to other species and OWFs. Digital-aerial data is used within this example, but similar steps apply for aerial-visual and boat-based-visual data.
+
+## Introduction to the data
+## Required Packages
+### Observations Data
+
+First, let's take a look at the raw observations data, stored in `observations`. This data should contain the individual birds/species observed and their associated locations, along with any other attributes of interest (behaviour, sex, age, etc).
+
+```{r, echo = FALSE}
+
+library(dplyr); library(sf); library(ggplot2)
+
+observations <- readRDS("all_observations.rds") |> 
+  filter(Species == "Kittiwake") |> 
+  select(c("Survey Date", "Camera", "Species", "Species Group", "BTO Code", "Behaviour", "Age", "Latitude", "Longitude")) |> 
+  mutate(`Survey Date` = lubridate::date(`Survey Date`))
+
+```
+
+```{r}
+
+head(observations)
+
+```
+
+This contains standard attributes for aerial-visual data. Note that we have already combined the datasets from different surveys spanning from 2015 to 2021, which you may need to do yourself:
+
+```{r}
+# See which days we have data on:
+table(observations$`Survey Date`)
+```
+
+Take note that, using **aerial-visual** or **vessel-based-visual** survey data, you will likely need to perform distance analysis to account for observation accuracy decreasing as you move farther from the observer.
+
+Whilst this will not be covered within this vignette, we recommend referring to the [Distance](https://distancesampling.org/Distance/index.html) package and its documentation.
+
+### Track Data
+
+Now, let's take a look at the track data (also sometimes referred to as effort or transect data). This is generally a GPS recording of the vessel/aircraft's route followed. We have stored this in `tracks`:
+
+```{r, echo = FALSE}
+tracks <- readRDS("all_tracks.rds") |> 
+  select(c("INDEX_", "DATE_", "LATITUDE", "LONGITUDE", "HEIGHT", "DISTANCE", "Shape")) |> 
+  rename(Longitude = LONGITUDE, Latitude = LATITUDE, datetime = DATE_) |> 
+  mutate(Date = lubridate::date(datetime))
+```
+
+```{r}
+head(tracks)
+```
+
+It is worth noting that this data is already in `sf` format - the location data is nested in the Shape column. Calling shapefiles through `st_read` will usually create an object of this format.
+
+Let's take a look at the raw tracks:
+
+```{r}
+ggplot(data = tracks) +
+  geom_sf(size = 0.25) +
+  facet_wrap(~Date)
+```
+
+The first important step is to ensure that all dates are accounted for in both the **track** and the **observation** data. If any are not accounted for, you will need to return to the source to find any missing data.
+
+The following line checks that no dates are missing from either dataset:
+
+```{r}
+
+all(unique(observations$`Survey Date`) %in% unique(tracks$Date)) & all(unique(tracks$Date) %in% unique(observations$`Survey Date`))
+
+```
+
+Looks good.
+
+## Assigning spatial 'effort-nodes'
+
+To perform modelling, we need a dataset consisting of spatial 'nodes' (X/Y coordinates) with an assigned 'Count' [number of birds] and 'Effort [spatial area observed at/near this node]. 
+
+It is good practice to ensure these nodes are well-balanced, i.e. that effort is distributed approximately evenly across nodes. We will create such nodes from the raw effort tracks here.
+
+This may not be necessary if the provided track/effort data is already recorded at a consistent spatial frequency - this is not true for our dataset, so we need to interpolate the tracks.
+
+First, we'll convert the observations to an `sf` object, using the latitude and longitude columns - this makes spatial operations and transformations easier. Ensure both tracks and obserations use the same spatial coordinate system.
+
+```{r}
+observations_sf <- st_as_sf(observations, coords = c("Longitude", "Latitude"), crs = 4326) |> 
+  st_transform(crs = st_crs(tracks)) # convert coordinate system
+```
+
+Now, we want to convert the tracks from `POINT` geometries into `LINESTRING` geometries, so that we can sample equidistant points. First, we need to remove any tracks outside of the surveyed region, such as points at which the plane was turning (and not recording observations).
+
+This can be done with a simple `st_filter` if you have the survey boundary polygon. If you don't, you can use a **concave** or **convex hull** to estimate it.
+
+Because our survey region has a rounded area, we'll estimate it using a **concave hull** with ratio 0.5.
+
+```{r}
+
+estimated_survey_region <- st_concave_hull(st_union(observations_sf), ratio = 0.5)
+filtered_tracks <- st_filter(tracks, estimated_survey_region)
+
+ggplot() + 
+  geom_sf(data = estimated_survey_region, fill = "pink", color = NA) +
+  geom_sf(data = filtered_tracks, color = "black", size = 0.25) +
+  facet_wrap(~Date) +
+  theme(axis.text = element_blank())
+
+```
+
+This is much better - we no longer overestimate effort by counting the times at which the plane was turning.
+
+### Track Interpolation
+
+Next, we want to convert each of these lines into 'transect' lines (as `LINESTRINGS`) and sample equidistant effort nodes along them.
+
+We'll split the data into individual transect-lines, where we assume that a movement step over 1km represents moving from one transect to the next:
+
+```{r}
+
+line_tracks <- filtered_tracks |> 
+  group_by(Date) |> 
+  mutate(
+    # Identify the distance steps between points
+    distance = st_distance(Shape, lag(Shape), by_element = T) |> 
+      units::set_units("km") |> 
+      units::drop_units(),
+    
+    # Now, we assume that any step over 1km represents a new transect
+    Transect = data.table::rleid(distance > 1)
+  ) |> 
+  
+  # Group these transects into lines
+  group_by(Date, Transect) |> 
+  summarise(
+    Shape = st_combine(Shape),
+    num_locs = n(),
+    .groups = "drop"
+  ) |> 
+  st_cast("LINESTRING") |> 
+  
+  # And finally, remove any irregular transects consisting of just 1 location
+  # as we cannot estimate effort for these
+  filter(num_locs > 1)
+
+# Let's see how this looks:
+ggplot() + 
+  geom_sf(data = estimated_survey_region, fill = "pink", color = NA) +
+  geom_sf(data = line_tracks, color = "black", size = 0.25) +
+  facet_wrap(~ Date) +
+  theme(axis.text = element_blank())
+
+
+```
+
+This looks plausible. Next, we need to estimate spatial effort. For some transects within this study, two cameras were reviewed - for others, four. This represents varying strip widths. 
+
+We'll identify which survey-dates used 4 cameras, i.e. a wider strip width, and join that to the lines. Each camera represents 125m of width, so we can calcualte the strip width too.
+
+```{r}
+cameras <- observations |>
+  group_by(`Survey Date`) |>
+  summarise(
+    numCameras = length(unique(Camera))
+  ) |>
+  rename(Date = `Survey Date`) |> 
+  mutate(Strip_Width = numCameras * 0.125)  # in Km
+
+line_tracks <- line_tracks |> 
+  left_join(cameras, by = "Date")
+
+head(cameras)
+```
+
+Now, we need to sample points across the transects. We'll use 500m intervals, but this value is situational. For visual surveys that apply the 'Snapshot' method for aerial data collection, it is recommended to use an interval greater than the **average distance travelled in one snapshot** - otherwise, your data may be poorly distributed across effort nodes.
+
+Note that this interpolation method works well for longer transects, but for shorter transects (e.g. non-aerial surveys) a more precise estimation should be used for effort-location calculation (or the rounding will lead to greater error).
+
+```{r}
+
+effort_locations <- line_tracks |> 
+  # First, calculate how many points must be sampled along the line
+  mutate(Transect_Length = st_length(Shape) |> 
+           units::set_units("km") |> 
+           units::drop_units(),
+         n_Sample_Locs = round(Transect_Length / 0.5)
+  ) |> 
+  # And sample this numer of locations
+  mutate(Shape = st_line_sample(Shape, n = n_Sample_Locs, type = "regular")) 
+
+effort_locations
+
+```
+
+This produces a `MULTIPOINT` object. We want one entry per effort-node, so we can disassemble this with `st_cast`:
+
+```{r}
+
+effort_locations <- st_cast(effort_locations, "POINT")
+effort_locations
+
+```
+
+The final step in effort-handling is to ensure spatial effort (i.e. the measured area observed) is assigned to each node. We can do this by measuring the distance between nodes and multiplying it by the transect width.
+
+```{r}
+
+effort_locations <- effort_locations |> 
+  mutate(
+    dist_to_last_node = st_distance(Shape, lag(Shape), by_element = T) |> 
+      units::set_units("km") |> units::drop_units(),
+    dist_to_next_node = st_distance(Shape, lead(Shape), by_element = T) |> 
+      units::set_units("km") |> units::drop_units(),
+    node_length = (dist_to_last_node + dist_to_next_node) / 2,
+    
+    # And finally, calculate spatial effort: 
+    # Node length X Transect width
+    node_effort = node_length * Strip_Width
+  ) |> 
+  
+  # And we will add an index column here, for later matching:
+  ungroup() |> 
+  mutate(index = row_number()) |> 
+  filter(!is.na(node_effort))
+
+```
+
+## Handling observations
+
+The final preproessing step is to associate the observations to a spatial effort node. There are a few ways to do this, but we'll use an `sf` method.
+
+If this method is being followed for several species, behaviours, or any other groupings that will be applied in modelling, the data should be grouped by further attributes for this step.
+
+```{r}
+
+snapped_observations <- observations_sf |>
+  # Split the data by survey date:
+  split(observations_sf$`Survey Date`) |> 
+  # And we will apply a function identifying the nearest node to each observation
+  lapply(function(observation_data) {
+    
+    # Get the effort tracks for this survey-date
+    today_tracks <- effort_locations |> 
+      filter(Date == unique(observation_data$`Survey Date`)) 
+    
+    # And we associate the effort node for each observation:
+    observation_data |> 
+      mutate(
+        
+        # First, we identify the index of the nearest node:
+        index = today_tracks$index[
+          st_nearest_feature(observation_data, 
+                             today_tracks)
+        ],
+        
+        # And secondly, the distance to that node
+        distance = st_nearest_points(observation_data,
+                                     st_combine(today_tracks)) |> 
+          st_length() |> 
+          units::set_units("km") |> 
+          units::drop_units()
+        
+      )
+  }) |> 
+  bind_rows() # rejoins the list
+
+```
+
+At this point, it's worth checking for any observations too far from effort nodes, and deciding what might have caused it. These could be caused by transcription errors or missing effort tracks. For this example, we filter out anything over 1km away.
+
+```{r}
+
+snapped_observations <- snapped_observations |> 
+  filter(distance < 1)
+
+```
+
+And finally, we 'count' the number of birds observed at each node and join that to the effort data. Watch out for columns representing the number of individuals observed - in this case, one row is one individual, so we can skip that.
+
+```{r}
+
+counts <- snapped_observations |> 
+  st_drop_geometry() |> # as we no longer need this to be spatial
+  group_by(index) |> 
+  summarise(Count = n(), .groups = "drop")
+
+effort_locations <- effort_locations |> 
+  left_join(counts, by = "index") |>
+  # fill NA counts with 0
+  mutate(Count = ifelse(is.na(Count), 0, Count))
+
+```
+
+This is now the format we want. We can simplify down to only the essential columns for modelling:
+
+```{r}
+
+modeldata <- effort_locations |> 
+  # Bind the coordinates on:
+  cbind(st_coordinates(effort_locations)) |> 
+  # Drop its sf column:
+  st_drop_geometry() |> 
+  select(c("Date", "Count", "X", "Y", "node_effort"))
+
+head(modeldata)
+
+```
+
